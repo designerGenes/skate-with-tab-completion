@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -112,7 +113,22 @@ Fish:
 			case "bash":
 				return cmd.Root().GenBashCompletion(os.Stdout)
 			case "zsh":
-				return cmd.Root().GenZshCompletion(os.Stdout)
+				buf := new(bytes.Buffer)
+				if err := cmd.Root().GenZshCompletion(buf); err != nil {
+					return err
+				}
+				script := buf.String()
+				// Prevent (eval):1: command not found: _skate error when words[1] is _skate or starts with _
+				script = strings.Replace(script, `requestComp="${words[1]} __complete`, `local compCmd="${words[1]}"
+    if [[ "${compCmd}" == _* || -z "${compCmd}" ]]; then
+        compCmd="skate"
+    fi
+    requestComp="${compCmd} __complete`, 1)
+				if strings.Contains(script, "compdef _skate skate") {
+					script = strings.Replace(script, "compdef _skate skate", "if type compdef &>/dev/null; then\n    compdef _skate skate\nfi", 1)
+				}
+				_, err := fmt.Fprint(os.Stdout, script)
+				return err
 			case "fish":
 				return cmd.Root().GenFishCompletion(os.Stdout, true)
 			case "powershell":
@@ -648,16 +664,41 @@ func getCompletion(cmd *cobra.Command, args []string, toComplete string) ([]stri
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
-		return dbs, cobra.ShellCompDirectiveNoFileComp
+		var completions []string
+		completions = append(completions, dbs...)
+		defaultKeys, err := getKeysInDb("")
+		if err == nil {
+			completions = append(completions, defaultKeys...)
+		}
+		return completions, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	if len(args) == 1 {
-		dbName := strings.TrimPrefix(args[0], "@")
-		keys, err := getKeysInDb(dbName)
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveNoFileComp
+		var dbName string
+		isDb := false
+		if strings.HasPrefix(args[0], "@") {
+			dbName = strings.TrimPrefix(args[0], "@")
+			isDb = true
+		} else {
+			dbs, err := getRawDbs()
+			if err == nil {
+				for _, d := range dbs {
+					if strings.EqualFold(d, args[0]) {
+						dbName = d
+						isDb = true
+						break
+					}
+				}
+			}
 		}
-		return keys, cobra.ShellCompDirectiveNoFileComp
+		if isDb {
+			keys, err := getKeysInDb(dbName)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return keys, cobra.ShellCompDirectiveNoFileComp
+		}
+		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	return nil, cobra.ShellCompDirectiveNoFileComp
@@ -683,16 +724,41 @@ func setCompletion(cmd *cobra.Command, args []string, toComplete string) ([]stri
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
-		return dbs, cobra.ShellCompDirectiveNoFileComp
+		var completions []string
+		completions = append(completions, dbs...)
+		defaultKeys, err := getKeysInDb("")
+		if err == nil {
+			completions = append(completions, defaultKeys...)
+		}
+		return completions, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	if len(args) == 1 {
-		dbName := strings.TrimPrefix(args[0], "@")
-		keys, err := getKeysInDb(dbName)
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveNoFileComp
+		var dbName string
+		isDb := false
+		if strings.HasPrefix(args[0], "@") {
+			dbName = strings.TrimPrefix(args[0], "@")
+			isDb = true
+		} else {
+			dbs, err := getRawDbs()
+			if err == nil {
+				for _, d := range dbs {
+					if strings.EqualFold(d, args[0]) {
+						dbName = d
+						isDb = true
+						break
+					}
+				}
+			}
 		}
-		return keys, cobra.ShellCompDirectiveNoFileComp
+		if isDb {
+			keys, err := getKeysInDb(dbName)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return keys, cobra.ShellCompDirectiveNoFileComp
+		}
+		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	return nil, cobra.ShellCompDirectiveNoFileComp
