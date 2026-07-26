@@ -41,27 +41,27 @@ var (
 	}
 
 	setCmd = &cobra.Command{
-		Use:     "set KEY[@DB] [VALUE]",
-		Short:   "Set a value for a key with an optional @ db. If VALUE is omitted, read value from the standard input.",
-		Example: "  skate set foo bar\n  skate set foo <./bar.txt",
-		Args:    cobra.RangeArgs(1, 2),
+		Use:     "set KEY[@DB] [VALUE] or set DB KEY [VALUE]",
+		Short:   "Set a value for a key with an optional @ db or DB name. If VALUE is omitted, read value from standard input.",
+		Example: "  skate set foo bar\n  skate set key1@group1 value1\n  skate set group1 key1 value1\n  skate set foo <./bar.txt",
+		Args:    cobra.RangeArgs(1, 3),
 		RunE:    set,
 	}
 
 	getCmd = &cobra.Command{
-		Use:           "get KEY[@DB]",
-		Short:         "Get a value for a key with an optional @ db.",
+		Use:           "get KEY[@DB] or get DB [KEY]",
+		Short:         "Get a value for a key with an optional @ db or DB name.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Args:          cobra.ExactArgs(1),
+		Args:          cobra.RangeArgs(1, 2),
 		RunE:          get,
 	}
 
 	deleteCmd = &cobra.Command{
-		Use:     "delete KEY[@DB]",
-		Short:   "Delete a key with an optional @ db.",
+		Use:     "delete KEY[@DB] or delete DB KEY",
+		Short:   "Delete a key with an optional @ db or DB name.",
 		Aliases: []string{"del", "rm"},
-		Args:    cobra.ExactArgs(1),
+		Args:    cobra.RangeArgs(1, 2),
 		RunE:    del,
 	}
 
@@ -89,6 +89,39 @@ var (
 		Args:    cobra.MinimumNArgs(1),
 		RunE:    deleteDb,
 	}
+
+	completionCmd = &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate shell completion script",
+		Long: `To load completions:
+
+Zsh:
+  $ source <(skate completion zsh)
+
+Bash:
+  $ source <(skate completion bash)
+
+Fish:
+  $ skate completion fish | source
+`,
+		DisableFlagsInUseLine: true,
+		ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
+		Args:                  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch args[0] {
+			case "bash":
+				return cmd.Root().GenBashCompletion(os.Stdout)
+			case "zsh":
+				return cmd.Root().GenZshCompletion(os.Stdout)
+			case "fish":
+				return cmd.Root().GenFishCompletion(os.Stdout, true)
+			case "powershell":
+				return cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
+			default:
+				return fmt.Errorf("unsupported shell: %s", args[0])
+			}
+		},
+	}
 )
 
 type errDBNotFound struct {
@@ -104,43 +137,143 @@ func (err errDBNotFound) Error() string {
 
 //nolint:wrapcheck
 func set(cmd *cobra.Command, args []string) error {
-	k, n, err := keyParser(args[0])
-	if err != nil {
-		return err
+	var key []byte
+	var dbName string
+	var valStr string
+	var hasVal bool
+
+	switch len(args) {
+	case 3:
+		dbName = strings.ToLower(strings.TrimPrefix(args[0], "@"))
+		key = []byte(strings.ToLower(args[1]))
+		valStr = args[2]
+		hasVal = true
+	case 2:
+		if strings.Contains(args[0], "@") {
+			k, n, err := keyParser(args[0])
+			if err != nil {
+				return err
+			}
+			key = k
+			dbName = n
+			valStr = args[1]
+			hasVal = true
+		} else {
+			dbs, _ := getRawDbs()
+			isDb := false
+			for _, d := range dbs {
+				if strings.EqualFold(d, args[0]) {
+					isDb = true
+					break
+				}
+			}
+			if isDb {
+				dbName = strings.ToLower(args[0])
+				key = []byte(strings.ToLower(args[1]))
+				hasVal = false
+			} else {
+				key = []byte(strings.ToLower(args[0]))
+				dbName = ""
+				valStr = args[1]
+				hasVal = true
+			}
+		}
+	case 1:
+		k, n, err := keyParser(args[0])
+		if err != nil {
+			return err
+		}
+		key = k
+		dbName = n
+		hasVal = false
 	}
-	db, err := openKV(n)
+
+	db, err := openKV(dbName)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
-	if len(args) == 2 {
+
+	if hasVal {
 		return wrap(db, false, func(tx *badger.Txn) error {
-			return tx.Set(k, []byte(args[1]))
+			return tx.Set(key, []byte(valStr))
 		})
 	}
+
 	bts, err := io.ReadAll(cmd.InOrStdin())
 	if err != nil {
 		return err
 	}
 	return wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Set(k, bts)
+		return tx.Set(key, bts)
 	})
 }
 
 //nolint:wrapcheck
 func get(_ *cobra.Command, args []string) error {
-	k, n, err := keyParser(args[0])
-	if err != nil {
-		return err
+	var key []byte
+	var dbName string
+
+	if len(args) == 2 {
+		dbName = strings.ToLower(strings.TrimPrefix(args[0], "@"))
+		key = []byte(strings.ToLower(args[1]))
+	} else if len(args) == 1 {
+		if strings.Contains(args[0], "@") {
+			k, n, err := keyParser(args[0])
+			if err != nil {
+				return err
+			}
+			key = k
+			dbName = n
+		} else {
+			dbs, _ := getRawDbs()
+			isDb := false
+			for _, d := range dbs {
+				if strings.EqualFold(d, args[0]) {
+					isDb = true
+					break
+				}
+			}
+
+			if isDb {
+				dbDefault, err := openKVReadOnly("")
+				keyExistsInDefault := false
+				if err == nil {
+					_ = dbDefault.View(func(tx *badger.Txn) error {
+						_, err := tx.Get([]byte(strings.ToLower(args[0])))
+						if err == nil {
+							keyExistsInDefault = true
+						}
+						return nil
+					})
+					dbDefault.Close() //nolint:errcheck
+				}
+
+				if keyExistsInDefault {
+					key = []byte(strings.ToLower(args[0]))
+					dbName = ""
+				} else {
+					return listDbKeysAndValues(args[0])
+				}
+			} else {
+				k, n, err := keyParser(args[0])
+				if err != nil {
+					return err
+				}
+				key = k
+				dbName = n
+			}
+		}
 	}
-	db, err := openKV(n)
+
+	db, err := openKV(dbName)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
 	var v []byte
 	if err := wrap(db, true, func(tx *badger.Txn) error {
-		item, err := tx.Get(k)
+		item, err := tx.Get(key)
 		if err != nil {
 			return err
 		}
@@ -153,19 +286,56 @@ func get(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func del(_ *cobra.Command, args []string) error {
-	k, n, err := keyParser(args[0])
+func listDbKeysAndValues(dbName string) error {
+	db, err := openKV(dbName)
 	if err != nil {
 		return err
 	}
-	db, err := openKV(n)
+	defer db.Close() //nolint:errcheck
+	return db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchSize = 10
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			k := item.Key()
+			err := item.Value(func(v []byte) error {
+				printFromKV("%s\t%s\n", k, v)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func del(_ *cobra.Command, args []string) error {
+	var key []byte
+	var dbName string
+
+	if len(args) == 2 {
+		dbName = strings.ToLower(strings.TrimPrefix(args[0], "@"))
+		key = []byte(strings.ToLower(args[1]))
+	} else if len(args) == 1 {
+		k, n, err := keyParser(args[0])
+		if err != nil {
+			return err
+		}
+		key = k
+		dbName = n
+	}
+
+	db, err := openKV(dbName)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
 
 	return wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Delete(k)
+		return tx.Delete(key)
 	})
 }
 
@@ -178,10 +348,7 @@ func listDbs(*cobra.Command, []string) error {
 	return err
 }
 
-// getDbs: returns a formatted list of available Skate DBs.
-//
-//nolint:wrapcheck
-func getDbs() ([]string, error) {
+func getRawDbs() ([]string, error) {
 	filepath, err := getFilePath()
 	if err != nil {
 		return nil, err
@@ -196,7 +363,58 @@ func getDbs() ([]string, error) {
 			dbList = append(dbList, e.Name())
 		}
 	}
+	return dbList, nil
+}
+
+// getDbs: returns a formatted list of available Skate DBs.
+//
+//nolint:wrapcheck
+func getDbs() ([]string, error) {
+	dbList, err := getRawDbs()
+	if err != nil {
+		return nil, err
+	}
 	return formatDbs(dbList), nil
+}
+
+func getKeysInDb(dbName string) ([]string, error) {
+	db, err := openKVReadOnly(dbName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close() //nolint:errcheck
+
+	var keys []string
+	err = db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			keys = append(keys, string(item.Key()))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func openKVReadOnly(name string) (*badger.DB, error) {
+	if name == "" {
+		name = "default"
+	}
+	path, err := getFilePath(name)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := os.Stat(path); os.IsNotExist(err) || !info.IsDir() {
+		return nil, fmt.Errorf("db does not exist")
+	}
+	opts := badger.DefaultOptions(path).WithLoggingLevel(badger.ERROR).WithReadOnly(true)
+	return badger.Open(opts)
 }
 
 func formatDbs(dbs []string) []string {
@@ -248,7 +466,6 @@ func deleteDb(_ *cobra.Command, args []string) error {
 	message = lipgloss.NewStyle().Width(78).Render(message)
 	fmt.Println(message)
 
-	// TODO: use huh
 	if _, err := fmt.Scanln(&confirmation); err != nil {
 		return err
 	}
@@ -309,6 +526,9 @@ func list(_ *cobra.Command, args []string) error {
 	}
 	if len(args) == 1 {
 		k = args[0]
+		if !strings.Contains(k, "@") {
+			k = "@" + k
+		}
 	}
 	_, n, err := keyParser(k)
 	if err != nil {
@@ -408,6 +628,111 @@ func openKV(name string) (*badger.DB, error) {
 	return badger.Open(badger.DefaultOptions(path).WithLoggingLevel(badger.ERROR)) //nolint:wrapcheck
 }
 
+func getCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) == 0 {
+		if strings.Contains(toComplete, "@") {
+			parts := strings.SplitN(toComplete, "@", 2)
+			keyPrefix := parts[0]
+			dbs, err := getRawDbs()
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+			var completions []string
+			for _, db := range dbs {
+				completions = append(completions, keyPrefix+"@"+db)
+			}
+			return completions, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		dbs, err := getRawDbs()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		return dbs, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	if len(args) == 1 {
+		dbName := strings.TrimPrefix(args[0], "@")
+		keys, err := getKeysInDb(dbName)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		return keys, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	return nil, cobra.ShellCompDirectiveNoFileComp
+}
+
+func setCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) == 0 {
+		if strings.Contains(toComplete, "@") {
+			parts := strings.SplitN(toComplete, "@", 2)
+			keyPrefix := parts[0]
+			dbs, err := getRawDbs()
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+			var completions []string
+			for _, db := range dbs {
+				completions = append(completions, keyPrefix+"@"+db)
+			}
+			return completions, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		dbs, err := getRawDbs()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		return dbs, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	if len(args) == 1 {
+		dbName := strings.TrimPrefix(args[0], "@")
+		keys, err := getKeysInDb(dbName)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		return keys, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	return nil, cobra.ShellCompDirectiveNoFileComp
+}
+
+func deleteCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return setCompletion(cmd, args, toComplete)
+}
+
+func listCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) == 0 {
+		dbs, err := getRawDbs()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		var completions []string
+		completions = append(completions, dbs...)
+		for _, db := range dbs {
+			if !contains(completions, "@"+db) {
+				completions = append(completions, "@"+db)
+			}
+		}
+		return completions, cobra.ShellCompDirectiveNoFileComp
+	}
+	return nil, cobra.ShellCompDirectiveNoFileComp
+}
+
+func deleteDbCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return listCompletion(cmd, args, toComplete)
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 func init() {
 	listCmd.Flags().BoolVarP(&reverseIterate, "reverse", "r", false, "list in reverse lexicographic order")
 	listCmd.Flags().BoolVarP(&keysIterate, "keys-only", "k", false, "only print keys and don't fetch values from the db")
@@ -416,6 +741,12 @@ func init() {
 	listCmd.Flags().BoolVarP(&showBinary, "show-binary", "b", false, "print binary values")
 	getCmd.Flags().BoolVarP(&showBinary, "show-binary", "b", false, "print binary values")
 
+	getCmd.ValidArgsFunction = getCompletion
+	setCmd.ValidArgsFunction = setCompletion
+	deleteCmd.ValidArgsFunction = deleteCompletion
+	listCmd.ValidArgsFunction = listCompletion
+	deleteDbCmd.ValidArgsFunction = deleteDbCompletion
+
 	rootCmd.AddCommand(
 		getCmd,
 		setCmd,
@@ -423,6 +754,7 @@ func init() {
 		listCmd,
 		listDbsCmd,
 		deleteDbCmd,
+		completionCmd,
 	)
 }
 
