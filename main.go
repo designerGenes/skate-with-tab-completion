@@ -119,11 +119,11 @@ Fish:
 				}
 				script := buf.String()
 				// Prevent (eval):1: command not found: _skate error when words[1] is _skate or starts with _
-				script = strings.Replace(script, `requestComp="${words[1]} __complete`, `local compCmd="${words[1]}"
+				script = strings.Replace(script, `requestComp="${words[1]}`, `local compCmd="${words[1]}"
     if [[ "${compCmd}" == _* || -z "${compCmd}" ]]; then
         compCmd="skate"
     fi
-    requestComp="${compCmd} __complete`, 1)
+    requestComp="${compCmd}`, 1)
 				if strings.Contains(script, "compdef _skate skate") {
 					script = strings.Replace(script, "compdef _skate skate", "if type compdef &>/dev/null; then\n    compdef _skate skate\nfi", 1)
 				}
